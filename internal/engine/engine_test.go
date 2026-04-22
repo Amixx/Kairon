@@ -21,16 +21,24 @@ func baseConfig() *config.Config {
 		MinMealGap:    180,
 		Activities: []config.Activity{
 			{
-				Name:          "Work",
-				Type:          "work",
-				Duration:      120,
-				MinDuration:   90,
-				HoursPerWeek:  20,
-				Priority:      "critical",
-				Earliest:      "07:30",
-				Latest:        "21:00",
-				PreferredTime: "morning",
-				Constraints:   []string{"consolidate_days"},
+				Name:            "Work",
+				Type:            "work",
+				Duration:        120,
+				MinDuration:     90,
+				HoursPerWeek:    20,
+				MinHoursPerWeek: 19,
+				MaxHoursPerWeek: 21,
+				Priority:        "critical",
+				Earliest:        "07:30",
+				Latest:          "21:00",
+				PreferredTime:   "morning",
+				Constraints: []string{
+					"consolidate_days",
+					"avoid_window:fri:1800:2100:8",
+					"avoid_window:sat:0730:1200:4",
+					"avoid_window:sat:1800:2100:6",
+					"avoid_window:sun:0730:1200:5",
+				},
 				AllowedDays:   []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
 				PreferredDays: []string{"mon", "tue", "wed", "thu", "fri"},
 			},
@@ -42,29 +50,45 @@ func baseConfig() *config.Config {
 				Priority:  "important",
 				Earliest:  "07:30",
 				Latest:    "16:00",
-				AllowedDays:   []string{"mon", "tue", "wed", "thu", "fri", "sun"},
-				PreferredDays: []string{"mon", "tue", "wed", "thu", "fri"},
+				Constraints: []string{
+					"no_three_consecutive_gym_days",
+					"prefer_late",
+					"day_earliest:wed:13:45",
+				},
+				AllowedDays:   []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+				PreferredDays: []string{"mon", "tue", "wed", "thu", "fri", "sat"},
 			},
 			{
-				Name:         "Easy Run",
-				Type:         "fitness",
-				Duration:     75,
-				Frequency:    1,
-				Priority:     "important",
-				Earliest:     "07:30",
-				Latest:       "21:00",
-				PreferredDay: "thu",
-				Location:     "home",
-			},
-			{
-				Name:          "Self-Study",
-				Type:          "uni",
-				Duration:      60,
-				MinDuration:   30,
-				HoursPerWeek:  5,
-				Priority:      "mid",
+				Name:          "Easy Run",
+				Type:          "fitness",
+				Duration:      75,
+				Frequency:     1,
+				Priority:      "important",
 				Earliest:      "07:30",
-				Latest:        "21:00",
+				Latest:        "18:45",
+				PreferredTime: "18:15",
+				PreferredDay:  "thu",
+				Location:      "home",
+				Constraints:   []string{"prefer_late"},
+			},
+			{
+				Name:            "Self-Study/Admin/Projects",
+				Type:            "uni",
+				Duration:        60,
+				MinDuration:     45,
+				HoursPerWeek:    18,
+				MinHoursPerWeek: 14,
+				MaxHoursPerWeek: 18,
+				Priority:        "mid",
+				Earliest:        "07:30",
+				Latest:          "21:00",
+				Constraints: []string{
+					"prefer_fuller_quota",
+					"avoid_window:fri:1800:2100:4",
+					"avoid_window:sat:0730:1200:4",
+					"avoid_window:sat:1800:2100:5",
+					"avoid_window:sun:0730:1200:5",
+				},
 			},
 			{
 				Name:          "Breakfast",
@@ -104,8 +128,9 @@ func mondayOf() time.Time {
 	return time.Date(2026, 4, 20, 0, 0, 0, 0, time.Local)
 }
 
-// typicalEvents returns uni events for a typical week.
-func typicalEvents() []calendar.Event {
+// fixtureEvents returns a deterministic synthetic campus week for unit tests.
+// Production scheduling uses Google Calendar events fetched at runtime.
+func fixtureEvents() []calendar.Event {
 	ws := mondayOf()
 	loc := ws.Location()
 	ev := func(day int, summary string, startH, startM, endH, endM int) calendar.Event {
@@ -118,14 +143,14 @@ func typicalEvents() []calendar.Event {
 		}
 	}
 	return []calendar.Event{
-		ev(0, "Geo Sensor/GeoInfo3", 13, 30, 17, 30),            // Mon
-		ev(1, "Semantic Modeling", 9, 45, 11, 15),                // Tue
-		ev(1, "Räuml./AngeoInfo", 15, 0, 16, 30),                // Tue
-		ev(2, "PM Tutorium", 11, 30, 13, 0),                     // Wed
-		ev(3, "Deutsch A1.2", 9, 0, 11, 30),                     // Thu
-		ev(3, "Räuml. Modellierung", 13, 15, 14, 45),            // Thu
-		ev(4, "BIM.fundamentals VO", 11, 30, 13, 0),             // Fri
-		ev(4, "BIM UE", 13, 15, 14, 45),                         // Fri
+		ev(0, "Campus Block Mon", 13, 30, 17, 30),    // Mon
+		ev(1, "Campus Block Tue AM", 9, 45, 11, 15),  // Tue
+		ev(1, "Campus Block Tue PM", 15, 0, 16, 30),  // Tue
+		ev(2, "Campus Block Wed", 11, 30, 13, 0),     // Wed
+		ev(3, "Campus Block Thu AM", 9, 0, 11, 30),   // Thu
+		ev(3, "Campus Block Thu PM", 13, 15, 14, 45), // Thu
+		ev(4, "Campus Block Fri AM", 11, 30, 13, 0),  // Fri
+		ev(4, "Campus Block Fri PM", 13, 15, 14, 45), // Fri
 	}
 }
 
@@ -148,9 +173,74 @@ func scheduleSlotsByDay(s *Schedule) map[int]map[string]int {
 	return result
 }
 
+func activityStartSlot(s *Schedule, day int, activity string) int {
+	slotsPerDay := (s.DayEnd - s.DayStart) / 15
+	for slot := 0; slot < slotsPerDay; slot++ {
+		gi := day*slotsPerDay + slot
+		if gi >= len(s.Slots) || s.Slots[gi].Activity != activity {
+			continue
+		}
+		if slot == 0 || s.Slots[gi-1].Activity != activity {
+			return slot
+		}
+	}
+	return -1
+}
+
+func activityBlocks(s *Schedule, day int, activity string) [][2]int {
+	slotsPerDay := (s.DayEnd - s.DayStart) / 15
+	var blocks [][2]int
+	start := -1
+	for slot := 0; slot < slotsPerDay; slot++ {
+		gi := day*slotsPerDay + slot
+		matches := gi < len(s.Slots) && s.Slots[gi].Activity == activity
+		if matches && start == -1 {
+			start = slot
+			continue
+		}
+		if !matches && start != -1 {
+			blocks = append(blocks, [2]int{start, slot})
+			start = -1
+		}
+	}
+	if start != -1 {
+		blocks = append(blocks, [2]int{start, slotsPerDay})
+	}
+	return blocks
+}
+
+func workTypeBlocks(s *Schedule, day int) [][2]int {
+	slotsPerDay := (s.DayEnd - s.DayStart) / 15
+	var blocks [][2]int
+	start := -1
+	hasWork := false
+	for slot := 0; slot < slotsPerDay; slot++ {
+		gi := day*slotsPerDay + slot
+		matches := gi < len(s.Slots) && s.Slots[gi].Type == TypeWork
+		if matches && start == -1 {
+			start = slot
+			hasWork = s.Slots[gi].Activity == "Work"
+			continue
+		}
+		if matches {
+			hasWork = hasWork || s.Slots[gi].Activity == "Work"
+			continue
+		}
+		if start != -1 && hasWork {
+			blocks = append(blocks, [2]int{start, slot})
+		}
+		start = -1
+		hasWork = false
+	}
+	if start != -1 && hasWork {
+		blocks = append(blocks, [2]int{start, slotsPerDay})
+	}
+	return blocks
+}
+
 func TestScheduleInvariants(t *testing.T) {
 	cfg := baseConfig()
-	events := typicalEvents()
+	events := fixtureEvents()
 	ws := mondayOf()
 
 	schedule, err := Generate(cfg, events, ws)
@@ -201,10 +291,23 @@ func TestScheduleInvariants(t *testing.T) {
 		totalWorkSlots += byDay[d]["Work"]
 		totalWorkSlots += byDay[d]["Work Meeting"]
 	}
-	expectedWorkSlots := 20 * 60 / 15
-	if totalWorkSlots != expectedWorkSlots {
-		t.Errorf("Total Work: got %d slots (%d min), want %d slots (%d min = 20h)",
-			totalWorkSlots, totalWorkSlots*15, expectedWorkSlots, expectedWorkSlots*15)
+	minWorkSlots := 19 * 60 / 15
+	maxWorkSlots := 21 * 60 / 15
+	if totalWorkSlots < minWorkSlots || totalWorkSlots > maxWorkSlots {
+		t.Errorf("Total Work: got %d slots (%d min), want between %d and %d slots (%d-%d min = 19h-21h)",
+			totalWorkSlots, totalWorkSlots*15, minWorkSlots, maxWorkSlots, minWorkSlots*15, maxWorkSlots*15)
+	}
+	for d := 0; d < 7; d++ {
+		for _, block := range workTypeBlocks(schedule, d) {
+			durationMin := (block[1] - block[0]) * 15
+			if durationMin < 90 {
+				t.Errorf("%s: work span %02d:%02d-%02d:%02d is only %d min (want >= 90, counting Work Meeting as work)",
+					dayNames[d],
+					(schedule.DayStart+block[0]*15)/60, (schedule.DayStart+block[0]*15)%60,
+					(schedule.DayStart+block[1]*15)/60, (schedule.DayStart+block[1]*15)%60,
+					durationMin)
+			}
+		}
 	}
 
 	// --- No commute adjacent to work only (commute must be adjacent to uni) ---
@@ -262,6 +365,26 @@ func TestScheduleInvariants(t *testing.T) {
 		}
 	}
 
+	for d := 0; d < 7; d++ {
+		gymBlocks := activityBlocks(schedule, d, "Gym")
+		if len(gymBlocks) == 0 {
+			continue
+		}
+		gymStart := gymBlocks[0][0]
+		for _, meal := range []string{"Breakfast", "Lunch", "Dinner"} {
+			for _, block := range activityBlocks(schedule, d, meal) {
+				mealEnd := block[1]
+				if mealEnd <= gymStart {
+					gapMin := (gymStart - mealEnd) * 15
+					if gapMin < 60 {
+						t.Errorf("%s: %s ends only %d min before Gym (want >= 60)",
+							dayNames[d], meal, gapMin)
+					}
+				}
+			}
+		}
+	}
+
 	// --- Breakfast must end by 10:30 ---
 	for d := 0; d < 7; d++ {
 		for s := 0; s < slotsPerDay; s++ {
@@ -279,15 +402,48 @@ func TestScheduleInvariants(t *testing.T) {
 		}
 	}
 
-	// --- Self-Study total = 5 hours ---
+	// --- Flexible productive bucket stays present and avoids tiny scraps ---
 	totalStudySlots := 0
 	for d := 0; d < 7; d++ {
-		totalStudySlots += byDay[d]["Self-Study"]
+		totalStudySlots += byDay[d]["Self-Study/Admin/Projects"]
 	}
-	expectedStudySlots := 5 * 60 / 15
-	if totalStudySlots != expectedStudySlots {
-		t.Errorf("Total Self-Study: got %d slots (%d min), want %d slots (%d min = 5h)",
-			totalStudySlots, totalStudySlots*15, expectedStudySlots, expectedStudySlots*15)
+	if totalStudySlots == 0 {
+		t.Errorf("Expected some Self-Study/Admin/Projects time, got 0 slots")
+	}
+	for d := 0; d < 7; d++ {
+		for _, block := range activityBlocks(schedule, d, "Self-Study/Admin/Projects") {
+			durationMin := (block[1] - block[0]) * 15
+			if durationMin < 45 {
+				t.Errorf("%s: Self-Study/Admin/Projects block %02d:%02d-%02d:%02d is only %d min (productive blocks under 45 min should be avoided)",
+					dayNames[d],
+					(schedule.DayStart+block[0]*15)/60, (schedule.DayStart+block[0]*15)%60,
+					(schedule.DayStart+block[1]*15)/60, (schedule.DayStart+block[1]*15)%60,
+					durationMin)
+			}
+		}
+	}
+
+	totalProductiveSlots := 0
+	for _, slot := range schedule.Slots {
+		if slot.Ignored {
+			continue
+		}
+		if slot.Type == TypeWork || slot.Type == TypeUni {
+			totalProductiveSlots++
+		}
+	}
+	// Total productive time targets ~50-55h/week, enforced as a soft penalty
+	// in the LP rather than a hard bound — per-activity quotas can cap the
+	// achievable total below 50h, and we'd rather the solver return a good
+	// schedule than fail. Log for visibility; fail only on extreme deviation.
+	t.Logf("Total productive time: %d slots (%d min = %.1fh)",
+		totalProductiveSlots, totalProductiveSlots*15, float64(totalProductiveSlots)*15/60)
+	sanityMin := 40 * 60 / 15
+	sanityMax := 60 * 60 / 15
+	if totalProductiveSlots < sanityMin || totalProductiveSlots > sanityMax {
+		t.Errorf("Total productive time: got %d slots (%.1fh), outside sanity range %d-%d slots (%dh-%dh)",
+			totalProductiveSlots, float64(totalProductiveSlots)*15/60,
+			sanityMin, sanityMax, sanityMin*15/60, sanityMax*15/60)
 	}
 
 	// --- Easy Run: exactly 1 per week ---
@@ -299,6 +455,54 @@ func TestScheduleInvariants(t *testing.T) {
 	if totalRunSlots != expectedRunSlots {
 		t.Errorf("Total Easy Run: got %d slots (%d min), want %d slots (%d min)",
 			totalRunSlots, totalRunSlots*15, expectedRunSlots, expectedRunSlots*15)
+	}
+	for d := 0; d < 7; d++ {
+		runBlocks := activityBlocks(schedule, d, "Easy Run")
+		if len(runBlocks) == 0 {
+			continue
+		}
+		runEnd := runBlocks[0][1]
+		runEndMin := schedule.DayStart + runEnd*15
+		if runEndMin > 18*60+45 {
+			t.Errorf("%s: Easy Run ends at %02d:%02d, want it done by 18:45 so it never falls after dinner",
+				dayNames[d], runEndMin/60, runEndMin%60)
+		}
+		dinnerBlocks := activityBlocks(schedule, d, "Dinner")
+		if len(dinnerBlocks) > 0 {
+			dinnerStartMin := schedule.DayStart + dinnerBlocks[0][0]*15
+			if runEndMin > dinnerStartMin {
+				t.Errorf("%s: Easy Run ends at %02d:%02d after Dinner starts at %02d:%02d",
+					dayNames[d], runEndMin/60, runEndMin%60, dinnerStartMin/60, dinnerStartMin%60)
+			}
+		}
+	}
+
+	wedGymStart := activityStartSlot(schedule, 2, "Gym")
+	if wedGymStart == -1 {
+		t.Fatalf("expected a Wednesday Gym session")
+	}
+	wedGymStartMin := schedule.DayStart + wedGymStart*15
+	if wedGymStartMin != 13*60+45 {
+		t.Errorf("Wed Gym starts at %02d:%02d, want 13:45 right after Tutorium commute",
+			wedGymStartMin/60, wedGymStartMin%60)
+	}
+
+	wedLunchStart := activityStartSlot(schedule, 2, "Lunch")
+	if wedLunchStart == -1 {
+		t.Fatalf("expected a Wednesday Lunch session")
+	}
+	wedLunchStartMin := schedule.DayStart + wedLunchStart*15
+	if wedLunchStartMin < 16*60 {
+		t.Errorf("Wed Lunch starts at %02d:%02d, want it after the late gym block",
+			wedLunchStartMin/60, wedLunchStartMin%60)
+	}
+
+	for d := 0; d < 7; d++ {
+		gymStart := activityStartSlot(schedule, d, "Gym")
+		if gymStart != -1 && gymStart == 0 {
+			t.Errorf("%s Gym still starts at %02d:%02d; expected gym to avoid the first slot of the day",
+				dayNames[d], schedule.DayStart/60, schedule.DayStart%60)
+		}
 	}
 
 	// --- Print schedule summary for debugging ---

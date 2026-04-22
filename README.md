@@ -21,6 +21,9 @@ go run ./cmd/scheduler/
 
 # Generate a specific week
 go run ./cmd/scheduler/ --week 2026-W17
+
+# Print MILP size by rule family before solving
+go run ./cmd/scheduler/ --audit-model
 ```
 
 Schedules are saved to `schedules/` as HTML files (e.g., `2026-W17.html`).

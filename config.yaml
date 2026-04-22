@@ -29,12 +29,18 @@ activities:
     duration: 120        # preferred block size in minutes
     min_duration: 90     # minimum block size
     hours_per_week: 20
+    min_hours_per_week: 19
+    max_hours_per_week: 21
     priority: critical
     earliest: "07:30"
     latest: "21:00"
     preferred_time: "morning"
     constraints:
       - "consolidate_days"       # fewer days with longer blocks preferred
+      - "avoid_window:fri:1800:2100:8"
+      - "avoid_window:sat:0730:1200:4"
+      - "avoid_window:sat:1800:2100:6"
+      - "avoid_window:sun:0730:1200:5"
     allowed_days: [mon, tue, wed, thu, fri, sat, sun]
     preferred_days: [mon, tue, wed, thu, fri]
     notes: "Sunday acceptable for overflow, Saturday less preferred"
@@ -49,9 +55,11 @@ activities:
     constraints:
       - "no_three_consecutive_gym_days"
       - "pattern: gym-gym-run-gym-gym"
-    allowed_days: [mon, tue, wed, thu, fri, sun]
-    preferred_days: [mon, tue, wed, thu, fri]
-    notes: "Avoid Saturday. One Sunday session OK if needed."
+      - "prefer_late"
+      - "day_earliest:wed:13:45"
+    allowed_days: [mon, tue, wed, thu, fri, sat, sun]
+    preferred_days: [mon, tue, wed, thu, fri, sat]
+    notes: "Bias gym as late as possible within its window; Wednesday should fall after Tutorium. Saturday is fine if it helps avoid awkward early sessions or 3-day streaks."
 
   - name: "Easy Run"
     type: fitness
@@ -59,20 +67,31 @@ activities:
     frequency: 1         # once per week
     priority: important
     earliest: "07:30"
-    latest: "21:00"
+    latest: "18:45"
+    preferred_time: "18:15"
     preferred_day: thu
     location: home
-    notes: "Home only, no commute needed. Counts as break between gym days."
+    constraints:
+      - "prefer_late"
+    notes: "Home only, no commute needed. Counts as break between gym days. Prefer it right before dinner; never after dinner."
 
-  - name: "Self-Study"
+  - name: "Self-Study/Admin/Projects"
     type: uni
     duration: 60         # preferred block size
-    min_duration: 30
-    hours_per_week: 5
+    min_duration: 45
+    hours_per_week: 18
+    min_hours_per_week: 14
+    max_hours_per_week: 18
     priority: mid
     earliest: "07:30"
     latest: "21:00"
-    notes: "Includes university admin tasks"
+    constraints:
+      - "prefer_fuller_quota"
+      - "avoid_window:fri:1800:2100:4"
+      - "avoid_window:sat:0730:1200:4"
+      - "avoid_window:sat:1800:2100:5"
+      - "avoid_window:sun:0730:1200:5"
+    notes: "Unified flexible productive bucket for self-study, admin, and projects. Its weekly range is tuned so total productive time usually lands around 50-55 hours/week."
 
   - name: "Breakfast"
     type: meal

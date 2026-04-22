@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{.Title}}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #F5F6FA;
+    color: #2c3e50;
+    padding: 24px;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 {
+    text-align: center;
+    font-size: 1.5rem;
+    font-weight: 600;
+    margin-bottom: 20px;
+    color: #34495e;
+  }
+  .grid-wrapper { overflow-x: auto; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    table-layout: fixed;
+  }
+  th {
+    background: #34495e;
+    color: #fff;
+    font-weight: 500;
+    font-size: 0.85rem;
+    padding: 8px 4px;
+    text-align: center;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  th.time-header { width: 56px; }
+  th .day-date { font-weight: 500; }
+  th .day-productive {
+    font-size: 0.7rem;
+    font-weight: 400;
+    color: #cbd5e0;
+    margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+  }
+  td {
+    height: 20px;
+    font-size: 0.7rem;
+    text-align: center;
+    vertical-align: middle;
+    border-left: 1px solid #e0e0e0;
+    border-bottom: 1px solid #e8e8e8;
+    padding: 0 2px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  td.time-cell {
+    background: #fff;
+    font-size: 0.7rem;
+    color: #7f8c8d;
+    text-align: right;
+    padding-right: 6px;
+    border-bottom: 1px solid #ddd;
+    font-variant-numeric: tabular-nums;
+  }
+  td.slot {
+    color: #fff;
+    font-weight: 500;
+    text-shadow: 0 1px 1px rgba(0,0,0,0.2);
+  }
+  td.slot.empty {
+    background: #fff;
+    color: transparent;
+    text-shadow: none;
+  }
+  td.slot.block-first {
+    border-top: 1px solid rgba(0,0,0,0.12);
+  }
+  td.slot.block-mid {
+    border-bottom-color: transparent;
+  }
+  td.slot.block-last {
+    border-bottom: 1px solid rgba(0,0,0,0.12);
+  }
+  td.slot.ignored {
+    opacity: 0.35;
+    background-image: repeating-linear-gradient(
+      135deg,
+      transparent,
+      transparent 4px,
+      rgba(255,255,255,0.3) 4px,
+      rgba(255,255,255,0.3) 8px
+    ) !important;
+  }
+  /* Hour lines */
+  tr.hour-start td {
+    border-top: 1px solid #ccc;
+  }
+  .legend {
+    margin-top: 24px;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 16px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: #555;
+  }
+  .legend-swatch {
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+  }
+  .summary {
+    margin-top: 24px;
+    text-align: center;
+  }
+  .summary h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    color: #34495e;
+    margin-bottom: 12px;
+  }
+  .summary-grid {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 16px;
+  }
+  .summary-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: #555;
+  }
+  .summary-swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+  }
+  .summary-hours {
+    font-weight: 600;
+    color: #2c3e50;
+  }
+  td.slot[data-tooltip] { cursor: default; }
+  #slot-tooltip {
+    position: fixed;
+    display: none;
+    background: #2c3e50;
+    color: #fff;
+    font-size: 0.72rem;
+    font-weight: 500;
+    line-height: 1.2;
+    padding: 5px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+    pointer-events: none;
+    z-index: 100;
+    font-variant-numeric: tabular-nums;
+    text-shadow: none;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>{{.Title}}</h1>
+  <div class="grid-wrapper">
+    <table>
+      <thead>
+        <tr>
+          <th class="time-header"></th>
+          {{- range .Days}}
+          <th>
+            <div class="day-date">{{.Date}}</div>
+            <div class="day-productive" title="Productive time on {{.Date}}">{{.ProductiveHM}}</div>
+          </th>
+          {{- end}}
+        </tr>
+      </thead>
+      <tbody>
+        {{- range $r := intRange $.NumRows}}
+        <tr{{if isHourStart $r $.Times}} class="hour-start"{{end}}>
+          <td class="time-cell">{{timeLabel $r $.Times}}</td>
+          {{- range $d := $.Days}}
+          {{- with index $d.Cells $r}}
+          {{- if eq .Activity ""}}
+          <td class="slot empty"></td>
+          {{- else}}
+          <td class="slot{{if .IsFirst}} block-first{{end}}{{if not .IsLast}} block-mid{{end}}{{if .IsLast}} block-last{{end}}{{if .Ignored}} ignored{{end}}" style="background-color: {{.Color}};"{{if .Tooltip}} data-tooltip="{{.Tooltip}}"{{end}}>{{if .IsFirst}}{{.Activity}}{{end}}</td>
+          {{- end}}
+          {{- end}}
+          {{- end}}
+        </tr>
+        {{- end}}
+      </tbody>
+    </table>
+  </div>
+  <div class="legend">
+    {{- range .Legend}}
+    <div class="legend-item">
+      <div class="legend-swatch" style="background: {{.Color}};"></div>
+      {{.Type}}
+    </div>
+    {{- end}}
+  </div>
+  <div class="summary">
+    <h2>Weekly Summary — {{.TotalHours}} total</h2>
+    <div class="summary-grid">
+      {{- range .Summary}}
+      <div class="summary-item">
+        <div class="summary-swatch" style="background: {{.Color}};"></div>
+        <span class="summary-type">{{.Type}}</span>
+        <span class="summary-hours">{{.Hours}}</span>
+      </div>
+      {{- end}}
+    </div>
+    <h2 style="margin-top: 18px;">Productive vs Regenerative</h2>
+    <div class="summary-grid">
+      {{- range .ProductivitySummary}}
+      <div class="summary-item">
+        <div class="summary-swatch" style="background: {{.Color}};"></div>
+        <span class="summary-type">{{.Type}}</span>
+        <span class="summary-hours">{{.Hours}}</span>
+      </div>
+      {{- end}}
+    </div>
+  </div>
+</div>
+<div id="slot-tooltip"></div>
+<script>
+(function () {
+  var tip = document.getElementById('slot-tooltip');
+  function show(e) {
+    var t = e.currentTarget.getAttribute('data-tooltip');
+    if (!t) return;
+    tip.textContent = t;
+    tip.style.display = 'block';
+    position(e);
+  }
+  function position(e) {
+    var pad = 12;
+    var x = e.clientX + pad;
+    var y = e.clientY - tip.offsetHeight - pad;
+    if (y < 4) y = e.clientY + pad;
+    var maxX = window.innerWidth - tip.offsetWidth - 4;
+    if (x > maxX) x = maxX;
+    tip.style.left = x + 'px';
+    tip.style.top = y + 'px';
+  }
+  function hide() { tip.style.display = 'none'; }
+  document.querySelectorAll('td.slot[data-tooltip]').forEach(function (el) {
+    el.addEventListener('mouseenter', show);
+    el.addEventListener('mousemove', position);
+    el.addEventListener('mouseleave', hide);
+  });
+})();
+</script>
+</body>
+</html>

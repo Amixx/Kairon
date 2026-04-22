@@ -22,6 +22,7 @@ func main() {
 	listCals := flag.Bool("list-calendars", false, "List available Google Calendar IDs and exit.")
 	port := flag.Int("port", 8080, "Port for the local HTTP server.")
 	configPath := flag.String("config", "config.yaml", "Path to config file.")
+	auditModel := flag.Bool("audit-model", false, "Print model size by rule family before solving.")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -70,7 +71,9 @@ func main() {
 	}
 	fmt.Printf("Fetched %d calendar events.\n", len(events))
 
-	schedule, err := engine.Generate(cfg, events, weekStart)
+	schedule, err := engine.GenerateWithOptions(cfg, events, weekStart, engine.GenerateOptions{
+		AuditModel: *auditModel,
+	})
 	if err != nil {
 		log.Fatalf("Generating schedule: %v", err)
 	}

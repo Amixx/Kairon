@@ -2,11 +2,14 @@ package engine
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,8 +33,30 @@ type actInstance struct {
 	id       string
 }
 
+type GenerateOptions struct {
+	AuditModel bool
+}
+
+type modelAudit struct {
+	ConstraintCount  int
+	BinaryVarCount   int
+	ConstraintGroups map[string]int
+	VariableGroups   map[string]int
+}
+
+type penaltyWindow struct {
+	start   int
+	end     int
+	penalty int
+}
+
 // Generate builds a weekly schedule using MILP via CBC.
 func Generate(cfg *config.Config, events []calendar.Event, weekStart time.Time) (*Schedule, error) {
+	return GenerateWithOptions(cfg, events, weekStart, GenerateOptions{})
+}
+
+// GenerateWithOptions builds a weekly schedule using MILP via CBC with optional diagnostics.
+func GenerateWithOptions(cfg *config.Config, events []calendar.Event, weekStart time.Time, opts GenerateOptions) (*Schedule, error) {
 	gran := cfg.Day.Granularity
 	dayStartMin := cfg.Day.StartMinutes()
 	dayEndMin := cfg.Day.EndMinutes()
@@ -170,6 +195,24 @@ func Generate(cfg *config.Config, events []calendar.Event, weekStart time.Time) 
 	for _, gi := range freeSlots {
 		freeSet[gi] = true
 	}
+	occupiedTypes := make(map[int]ActivityType, len(occupied))
+	for gi, occ := range occupied {
+		occupiedTypes[gi] = occ.typ
+	}
+
+	// Count fixed (non-ignored) productive slots already on the grid. These
+	// contribute to the week's total productive time but are outside the LP's
+	// decision variables, so the solver needs to know their count when
+	// targeting the 50-55h soft range.
+	fixedProdSlots := 0
+	for _, occ := range occupied {
+		if occ.ignored {
+			continue
+		}
+		if occ.typ == TypeWork || occ.typ == TypeUni {
+			fixedProdSlots++
+		}
+	}
 
 	// Build activity instances
 	instances := buildInstances(cfg, gran)
@@ -184,15 +227,59 @@ func Generate(cfg *config.Config, events []calendar.Event, weekStart time.Time) 
 	lpFile := filepath.Join(tmpDir, "schedule.lp")
 	solFile := filepath.Join(tmpDir, "schedule.sol")
 
-	if err := writeLPFile(lpFile, instances, cfg, slots, freeSet, slotsPerDay, gran, dayStartMin); err != nil {
+	if err := writeLPFile(lpFile, instances, cfg, slots, freeSet, occupiedTypes, slotsPerDay, gran, dayStartMin, fixedProdSlots); err != nil {
 		return nil, fmt.Errorf("writing LP file: %w", err)
 	}
+	if opts.AuditModel {
+		audit, err := auditLPFile(lpFile)
+		if err != nil {
+			return nil, fmt.Errorf("auditing LP file: %w", err)
+		}
+		printModelAudit(os.Stderr, audit)
+	}
 
-	// Solve with time limit
-	cmd := exec.Command("cbc", lpFile, "solve", "-sec", "30", "-solution", solFile)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("CBC solver failed: %w\nOutput: %s", err, string(output))
+	// Solve with time limit and lightweight progress updates.
+	const solverLimit = 45 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), solverLimit+5*time.Second)
+	defer cancel()
+
+	fmt.Fprintf(os.Stderr, "scheduler: generated MILP, starting CBC solve (limit %s)\n", solverLimit)
+	cmd := exec.CommandContext(ctx, "cbc", lpFile, "solve", "-sec", "45", "-solution", solFile)
+	var outputBuf bytes.Buffer
+	cmd.Stdout = &outputBuf
+	cmd.Stderr = &outputBuf
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("starting CBC solver: %w", err)
+	}
+	done := make(chan error, 1)
+	startedAt := time.Now()
+	go func() {
+		done <- cmd.Wait()
+	}()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	var solverErr error
+	for {
+		select {
+		case solverErr = <-done:
+			elapsed := time.Since(startedAt).Round(time.Second)
+			fmt.Fprintf(os.Stderr, "scheduler: CBC finished in %s\n", elapsed)
+			goto solverDone
+		case <-ticker.C:
+			elapsed := time.Since(startedAt).Round(time.Second)
+			remaining := solverLimit - time.Since(startedAt)
+			if remaining < 0 {
+				remaining = 0
+			}
+			fmt.Fprintf(os.Stderr, "scheduler: solving... elapsed %s, up to ~%s remaining before timeout\n",
+				elapsed, remaining.Round(time.Second))
+		}
+	}
+
+solverDone:
+	output := outputBuf.Bytes()
+	if solverErr != nil {
+		return nil, fmt.Errorf("CBC solver failed: %w\nOutput: %s", solverErr, string(output))
 	}
 
 	// Check if solution file was written (CBC exits 0 even if infeasible)
@@ -274,6 +361,8 @@ func Generate(cfg *config.Config, events []calendar.Event, weekStart time.Time) 
 		}
 	}
 
+	relabelShortBreakSlivers(schedule, cfg, slotsPerDay)
+
 	// Validate invariants
 	if errs := validateSchedule(schedule, cfg, slotsPerDay); len(errs) > 0 {
 		fmt.Fprintln(os.Stderr, "⚠️  Schedule validation warnings:")
@@ -349,15 +438,56 @@ func validateSchedule(schedule *Schedule, cfg *config.Config, slotsPerDay int) [
 		if act.HoursPerWeek == 0 {
 			continue
 		}
-		expectedSlots := int(act.HoursPerWeek*60/float64(cfg.Day.Granularity)) - fixedSlotsByType[act.Type]
+		minSlots := int(act.HoursPerWeek*60/float64(cfg.Day.Granularity)) - fixedSlotsByType[act.Type]
+		if act.MinHoursPerWeek > 0 {
+			minSlots = int(act.MinHoursPerWeek*60/float64(cfg.Day.Granularity)) - fixedSlotsByType[act.Type]
+		}
+		maxSlots := int(act.HoursPerWeek*60/float64(cfg.Day.Granularity)) - fixedSlotsByType[act.Type]
+		if act.MaxHoursPerWeek > 0 {
+			maxSlots = int(act.MaxHoursPerWeek*60/float64(cfg.Day.Granularity)) - fixedSlotsByType[act.Type]
+		}
 		totalSlots := 0
 		for d := 0; d < 7; d++ {
 			totalSlots += dayActivity[d][act.Name]
 		}
-		if totalSlots != expectedSlots {
-			errs = append(errs, fmt.Sprintf("%s: %d total slots (%d min), want %d (%d min = %.0fh/week minus fixed events)",
-				act.Name, totalSlots, totalSlots*cfg.Day.Granularity,
-				expectedSlots, expectedSlots*cfg.Day.Granularity, act.HoursPerWeek))
+		if totalSlots < minSlots || totalSlots > maxSlots {
+			if minSlots == maxSlots {
+				errs = append(errs, fmt.Sprintf("%s: %d total slots (%d min), want %d (%d min = %.0fh/week minus fixed events)",
+					act.Name, totalSlots, totalSlots*cfg.Day.Granularity,
+					minSlots, minSlots*cfg.Day.Granularity, act.HoursPerWeek))
+			} else {
+				errs = append(errs, fmt.Sprintf("%s: %d total slots (%d min), want between %d and %d slots (%d-%d min/week)",
+					act.Name, totalSlots, totalSlots*cfg.Day.Granularity,
+					minSlots, maxSlots, minSlots*cfg.Day.Granularity, maxSlots*cfg.Day.Granularity))
+			}
+		}
+
+		if act.Name == "Work" && act.MinDuration > 0 {
+			minSlots := act.MinDuration / cfg.Day.Granularity
+			for d := 0; d < 7; d++ {
+				run := 0
+				hasWork := false
+				for s := 0; s < slotsPerDay; s++ {
+					gi := d*slotsPerDay + s
+					if gi < len(schedule.Slots) && schedule.Slots[gi].Type == TypeWork {
+						run++
+						if schedule.Slots[gi].Activity == act.Name {
+							hasWork = true
+						}
+						continue
+					}
+					if run > 0 && hasWork && run < minSlots {
+						errs = append(errs, fmt.Sprintf("%s on %s: %d min block is shorter than minimum %d min",
+							act.Name, dayNames[d], run*cfg.Day.Granularity, act.MinDuration))
+					}
+					run = 0
+					hasWork = false
+				}
+				if run > 0 && hasWork && run < minSlots {
+					errs = append(errs, fmt.Sprintf("%s on %s: %d min block is shorter than minimum %d min",
+						act.Name, dayNames[d], run*cfg.Day.Granularity, act.MinDuration))
+				}
+			}
 		}
 	}
 
@@ -380,6 +510,13 @@ func validateSchedule(schedule *Schedule, cfg *config.Config, slotsPerDay int) [
 		}
 		if hasCommute && !hasUni {
 			errs = append(errs, fmt.Sprintf("Commute on %s but no uni events", dayNames[d]))
+		}
+	}
+
+	// Gym and Easy Run must not share a day.
+	for d := 0; d < 7; d++ {
+		if dayActivity[d]["Gym"] > 0 && dayActivity[d]["Easy Run"] > 0 {
+			errs = append(errs, fmt.Sprintf("Gym and Easy Run both scheduled on %s", dayNames[d]))
 		}
 	}
 
@@ -413,7 +550,7 @@ func buildInstances(cfg *config.Config, gran int) []actInstance {
 	return instances
 }
 
-func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots []slotInfo, freeSet map[int]bool, slotsPerDay, gran, dayStartMin int) error {
+func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots []slotInfo, freeSet map[int]bool, occupiedTypes map[int]ActivityType, slotsPerDay, gran, dayStartMin, fixedProdSlots int) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -448,17 +585,28 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 	// For each frequency instance, create start variables
 	for _, inst := range freqInstances {
 		var startVars []string
-		earliest := parseHHMM(inst.act.Earliest)
-		latest := parseHHMM(inst.act.Latest)
-		if latest == 0 {
-			latest = cfg.Day.EndMinutes()
-		}
 		prefTime := parseHHMM(inst.act.PreferredTime)
 
 		for d := 0; d < 7; d++ {
 			if !isDayAllowed(inst.act, d) {
 				continue
 			}
+			earliest := parseHHMM(inst.act.Earliest)
+			if dayEarliest, ok := constraintTimeForDay(inst.act.Constraints, "day_earliest", d); ok && dayEarliest > earliest {
+				earliest = dayEarliest
+			}
+			latest := parseHHMM(inst.act.Latest)
+			if dayLatest, ok := constraintTimeForDay(inst.act.Constraints, "day_latest", d); ok {
+				latest = dayLatest
+			}
+			if latest == 0 {
+				latest = cfg.Day.EndMinutes()
+			}
+			latestStart := latest - inst.duration*gran
+			if latestStart < dayStartMin {
+				latestStart = dayStartMin
+			}
+
 			for s := 0; s < slotsPerDay; s++ {
 				slotStart := dayStartMin + s*gran
 				slotEnd := slotStart + inst.duration*gran
@@ -509,6 +657,14 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 				// Prefer preferred days
 				if isPreferredDay(inst.act, d) {
 					objCoeffs[sv] -= 10
+				}
+
+				// Some activities, like gym, work better later in their feasible window.
+				if contains(inst.act.Constraints, "prefer_late") {
+					latePenalty := (latestStart - slotStart) / gran
+					if latePenalty > 0 {
+						objCoeffs[sv] += latePenalty * 2
+					}
 				}
 			}
 		}
@@ -595,7 +751,15 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 
 	// --- Hourly activities (work, study) ---
 	for _, inst := range hourlyInstances {
-		totalSlots := int(inst.act.HoursPerWeek*60/float64(gran)) - fixedSlotsByType[inst.act.Type]
+		targetSlots := int(inst.act.HoursPerWeek*60/float64(gran)) - fixedSlotsByType[inst.act.Type]
+		minSlots := targetSlots
+		if inst.act.MinHoursPerWeek > 0 {
+			minSlots = int(inst.act.MinHoursPerWeek*60/float64(gran)) - fixedSlotsByType[inst.act.Type]
+		}
+		maxSlots := targetSlots
+		if inst.act.MaxHoursPerWeek > 0 {
+			maxSlots = int(inst.act.MaxHoursPerWeek*60/float64(gran)) - fixedSlotsByType[inst.act.Type]
+		}
 		earliest := parseHHMM(inst.act.Earliest)
 		latest := parseHHMM(inst.act.Latest)
 		if latest == 0 {
@@ -605,6 +769,7 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 		if minBlock < 1 {
 			minBlock = 1
 		}
+		allowOccupiedBridge := inst.act.Type == "work"
 
 		var xVars []string
 		for d := 0; d < 7; d++ {
@@ -654,6 +819,18 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 				if isPreferredDay(inst.act, d) {
 					objCoeffs[xv] -= 2
 				}
+
+				if inst.act.Type == "work" && hasAdjacentOccupiedType(d, s, slotsPerDay, occupiedTypes, ActivityType(inst.act.Type)) {
+					objCoeffs[xv] -= 4
+				}
+				for _, window := range constraintPenaltyWindowsForDay(inst.act.Constraints, d) {
+					if slotStart >= window.start && slotStart < window.end {
+						objCoeffs[xv] += window.penalty
+					}
+				}
+				if contains(inst.act.Constraints, "prefer_fuller_quota") {
+					objCoeffs[xv] -= 1
+				}
 			}
 		}
 
@@ -661,7 +838,12 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 		if len(xVars) == 0 {
 			return fmt.Errorf("no feasible slots for activity %s", inst.id)
 		}
-		constraints = append(constraints, fmt.Sprintf("  quota_%s: %s = %d", inst.id, strings.Join(xVars, " + "), totalSlots))
+		if minSlots == maxSlots {
+			constraints = append(constraints, fmt.Sprintf("  quota_%s: %s = %d", inst.id, strings.Join(xVars, " + "), minSlots))
+		} else {
+			constraints = append(constraints, fmt.Sprintf("  quota_min_%s: %s >= %d", inst.id, strings.Join(xVars, " + "), minSlots))
+			constraints = append(constraints, fmt.Sprintf("  quota_max_%s: %s <= %d", inst.id, strings.Join(xVars, " + "), maxSlots))
+		}
 
 		// Minimum block size constraints
 		// If x[d][s]=1 and x[d][s-1]=0, then x[d][s+1]..x[d][s+minBlock-1] must all be 1
@@ -685,55 +867,81 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 
 					xCur := fmt.Sprintf("x_%s_%d_%d", inst.id, d, s)
 
-					// Check if s-1 exists and is free
 					prevFree := false
+					prevSameTypeOccupied := false
+					backCompatOccupied := 0
 					if s > 0 {
 						prevGi := d*slotsPerDay + s - 1
 						prevStart := dayStartMin + (s-1)*gran
 						if freeSet[prevGi] && (earliest == 0 || prevStart >= earliest) && (latest == 0 || prevStart+gran <= latest) {
 							prevFree = true
 						}
+						if allowOccupiedBridge && occupiedTypes[prevGi] == ActivityType(inst.act.Type) {
+							prevSameTypeOccupied = true
+							for back := s - 1; back >= 0; back-- {
+								backGi := d*slotsPerDay + back
+								if occupiedTypes[backGi] != ActivityType(inst.act.Type) {
+									break
+								}
+								backCompatOccupied++
+							}
+						}
 					}
 
-					if !prevFree {
-						// This slot could be a block start. If x[d][s]=1, next minBlock-1 must be 1
-						for k := 1; k < minBlock; k++ {
-							nextS := s + k
-							if nextS >= slotsPerDay {
-								// Can't place a full block here — forbid starting
-								constraints = append(constraints, fmt.Sprintf("  noshort_%s_%d_%d: %s = 0", inst.id, d, s, xCur))
-								break
-							}
+					collectRequiredFuture := func(initialCompat int) ([]int, bool) {
+						neededCompat := minBlock - initialCompat
+						if neededCompat <= 0 {
+							return nil, true
+						}
+						var requiredFreeSlots []int
+						for nextS := s + 1; nextS < slotsPerDay; nextS++ {
 							nextGi := d*slotsPerDay + nextS
-							if !freeSet[nextGi] {
-								constraints = append(constraints, fmt.Sprintf("  noshort_%s_%d_%d: %s = 0", inst.id, d, s, xCur))
-								break
+							nextStart := dayStartMin + nextS*gran
+							if allowOccupiedBridge && occupiedTypes[nextGi] == ActivityType(inst.act.Type) {
+								neededCompat--
+							} else if freeSet[nextGi] && (latest == 0 || nextStart+gran <= latest) {
+								requiredFreeSlots = append(requiredFreeSlots, nextS)
+								neededCompat--
+							} else {
+								return nil, false
 							}
+							if neededCompat == 0 {
+								return requiredFreeSlots, true
+							}
+						}
+						return nil, false
+					}
+					if !prevFree && !prevSameTypeOccupied {
+						requiredFreeSlots, ok := collectRequiredFuture(1)
+						if !ok {
+							constraints = append(constraints, fmt.Sprintf("  noshort_%s_%d_%d: %s = 0", inst.id, d, s, xCur))
+							continue
+						}
+						for k, nextS := range requiredFreeSlots {
 							xNext := fmt.Sprintf("x_%s_%d_%d", inst.id, d, nextS)
-							constraints = append(constraints, fmt.Sprintf("  minblk_%s_%d_%d_%d: %s - %s >= 0", inst.id, d, s, k, xNext, xCur))
+							constraints = append(constraints, fmt.Sprintf("  minblk_%s_%d_%d_%d: %s - %s >= 0", inst.id, d, s, k+1, xNext, xCur))
+						}
+					} else if prevSameTypeOccupied && !prevFree {
+						requiredFreeSlots, ok := collectRequiredFuture(backCompatOccupied + 1)
+						if !ok {
+							constraints = append(constraints, fmt.Sprintf("  noshort_%s_%d_%d: %s = 0", inst.id, d, s, xCur))
+							continue
+						}
+						for k, nextS := range requiredFreeSlots {
+							xNext := fmt.Sprintf("x_%s_%d_%d", inst.id, d, nextS)
+							constraints = append(constraints, fmt.Sprintf("  minblk_%s_%d_%d_%d: %s - %s >= 0", inst.id, d, s, k+1, xNext, xCur))
 						}
 					} else {
-						// Interior or continuation — if prev=0 and cur=1, need next minBlock-1
 						xPrev := fmt.Sprintf("x_%s_%d_%d", inst.id, d, s-1)
-						// b_start = cur - prev (1 if block starts here)
-						// We need: if b_start=1, then next minBlock-1 slots are 1
-						// Linearize: x_next >= x_cur - x_prev for each of next minBlock-1 slots
-						for k := 1; k < minBlock; k++ {
-							nextS := s + k
-							if nextS >= slotsPerDay {
-								break
-							}
-							nextGi := d*slotsPerDay + nextS
-							if !freeSet[nextGi] {
-								break
-							}
-							nextStart := dayStartMin + nextS*gran
-							if latest > 0 && nextStart+gran > latest {
-								break
-							}
+						requiredFreeSlots, ok := collectRequiredFuture(1)
+						if !ok {
+							constraints = append(constraints, fmt.Sprintf("  noshort_%s_%d_%d: %s - %s <= 0", inst.id, d, s, xCur, xPrev))
+							continue
+						}
+						for k, nextS := range requiredFreeSlots {
 							xNext := fmt.Sprintf("x_%s_%d_%d", inst.id, d, nextS)
 							constraints = append(constraints, fmt.Sprintf("  minblk_%s_%d_%d_%d: %s - %s + %s >= 0",
-								inst.id, d, s, k, xNext, xCur, xPrev))
+								inst.id, d, s, k+1, xNext, xCur, xPrev))
 						}
 					}
 				}
@@ -786,9 +994,52 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 		}
 	}
 
+	// --- Soft total productive time: target 50-55h/week ---
+	// Sum of all productive (work/uni) x vars plus pre-placed fixed productive
+	// slots should land in [50h, 55h]. Rather than enforcing as a hard bound
+	// (which can clash with per-activity quotas and make the model infeasible),
+	// we penalize slots of deviation on either side.
+	{
+		minProdSlots := 50 * 60 / gran
+		maxProdSlots := 55 * 60 / gran
+		remainingMin := minProdSlots - fixedProdSlots
+		if remainingMin < 0 {
+			remainingMin = 0
+		}
+		remainingMax := maxProdSlots - fixedProdSlots
+		if remainingMax < 0 {
+			remainingMax = 0
+		}
+
+		var prodXVars []string
+		for _, inst := range instances {
+			if inst.act.Type != "work" && inst.act.Type != "uni" {
+				continue
+			}
+			prefix := fmt.Sprintf("x_%s_", inst.id)
+			for v := range declaredXVars {
+				if strings.HasPrefix(v, prefix) {
+					prodXVars = append(prodXVars, v)
+				}
+			}
+		}
+		if len(prodXVars) > 0 {
+			sumStr := strings.Join(prodXVars, " + ")
+			constraints = append(constraints,
+				fmt.Sprintf("  prodmin: %s + under_prod >= %d", sumStr, remainingMin))
+			constraints = append(constraints,
+				fmt.Sprintf("  prodmax: %s - over_prod <= %d", sumStr, remainingMax))
+			const prodDeviationPenalty = 25
+			objCoeffs["under_prod"] += prodDeviationPenalty
+			objCoeffs["over_prod"] += prodDeviationPenalty
+			// under_prod and over_prod are left out of the Binary section so CBC
+			// treats them as non-negative continuous slack variables.
+		}
+	}
+
 	// --- No 3 consecutive gym days ---
 	gymInstances := nameToInstances["Gym"]
-	if len(gymInstances) > 0 {
+	if len(gymInstances) > 0 && instancesHaveConstraint(gymInstances, "no_three_consecutive_gym_days") {
 		for d := 0; d <= 4; d++ { // d, d+1, d+2
 			var threeDay []string
 			for _, inst := range gymInstances {
@@ -804,6 +1055,35 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 			}
 			if len(threeDay) > 0 {
 				constraints = append(constraints, fmt.Sprintf("  no3gym_%d: %s <= 2", d, strings.Join(threeDay, " + ")))
+			}
+		}
+	}
+
+	// --- Easy Run and Gym cannot share a day ---
+	runInstances := nameToInstances["Easy Run"]
+	if len(gymInstances) > 0 && len(runInstances) > 0 {
+		for d := 0; d < 7; d++ {
+			dayStr := strconv.Itoa(d)
+			var dayStarts []string
+			for _, inst := range gymInstances {
+				for _, sv := range instStartVars[inst.id] {
+					parts := strings.Split(sv, "_")
+					if len(parts) >= 3 && parts[len(parts)-2] == dayStr {
+						dayStarts = append(dayStarts, sv)
+					}
+				}
+			}
+			for _, inst := range runInstances {
+				for _, sv := range instStartVars[inst.id] {
+					parts := strings.Split(sv, "_")
+					if len(parts) >= 3 && parts[len(parts)-2] == dayStr {
+						dayStarts = append(dayStarts, sv)
+					}
+				}
+			}
+			if len(dayStarts) > 1 {
+				constraints = append(constraints, fmt.Sprintf("  nogymrun_%d: %s <= 1",
+					d, strings.Join(dayStarts, " + ")))
 			}
 		}
 	}
@@ -880,9 +1160,9 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 		}
 	}
 
-	// --- Soft constraint: meals should be at least 1h before gym ---
-	// Instead of per-instance pairs, use aggregated gym-day indicators and
-	// per-meal-type-day indicators to keep variable count small.
+	// --- Hard constraint: meals must finish at least 1h before gym ---
+	// Use aggregated gym-day indicators and per-meal-type-day indicators to keep
+	// the constraint count manageable.
 	{
 		mealGymGapSlots := 60 / gran // 4 slots = 1h
 		gymInsts := nameToInstances["Gym"]
@@ -922,7 +1202,7 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 			}
 
 			// For each (meal-agg-slot, gym-agg-slot) on same day where gap < 1h,
-			// add a penalty variable: p >= m + g - 1
+			// disallow choosing both placements together.
 			for mKey, mv := range mealSlotVars {
 				mealDur := mealDurByName[mKey.name]
 				if mealDur == 0 {
@@ -935,11 +1215,8 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 					}
 					gap := gKey.slot - mealEnd
 					if gap >= 0 && gap < mealGymGapSlots {
-						penalty := (mealGymGapSlots - gap) * 3
-						pv := fmt.Sprintf("mgym_%s_%d_%d_%d", sanitize(mKey.name), mKey.day, mKey.slot, gKey.slot)
-						binVars = append(binVars, pv)
-						objCoeffs[pv] += penalty
-						constraints = append(constraints, fmt.Sprintf("  %s_lnk: %s - %s - %s >= -1", pv, pv, mv, gv))
+						constraints = append(constraints, fmt.Sprintf("  mealgymgap_%s_%d_%d_%d: %s + %s <= 1",
+							sanitize(mKey.name), mKey.day, mKey.slot, gKey.slot, mv, gv))
 					}
 				}
 			}
@@ -985,6 +1262,139 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 
 	fmt.Fprintln(w, "End")
 	return nil
+}
+
+func auditLPFile(path string) (*modelAudit, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	audit := &modelAudit{
+		ConstraintGroups: make(map[string]int),
+		VariableGroups:   make(map[string]int),
+	}
+
+	section := ""
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		switch line {
+		case "Subject To":
+			section = "constraints"
+			continue
+		case "Binary":
+			section = "binary"
+			continue
+		case "End", "Minimize":
+			section = ""
+			continue
+		}
+		if line == "" || strings.HasPrefix(line, "obj:") {
+			continue
+		}
+
+		switch section {
+		case "constraints":
+			label := line
+			if idx := strings.Index(line, ":"); idx != -1 {
+				label = strings.TrimSpace(line[:idx])
+			}
+			audit.ConstraintCount++
+			audit.ConstraintGroups[auditConstraintGroup(label)]++
+		case "binary":
+			audit.BinaryVarCount++
+			audit.VariableGroups[auditVariableGroup(line)]++
+		}
+	}
+
+	return audit, scanner.Err()
+}
+
+func printModelAudit(w *os.File, audit *modelAudit) {
+	fmt.Fprintf(w, "scheduler: model audit: %d constraints, %d binary vars\n", audit.ConstraintCount, audit.BinaryVarCount)
+	printAuditGroups(w, "constraint groups", audit.ConstraintGroups)
+	printAuditGroups(w, "variable groups", audit.VariableGroups)
+}
+
+func printAuditGroups(w *os.File, title string, groups map[string]int) {
+	type kv struct {
+		name  string
+		count int
+	}
+	var entries []kv
+	for name, count := range groups {
+		entries = append(entries, kv{name: name, count: count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count == entries[j].count {
+			return entries[i].name < entries[j].name
+		}
+		return entries[i].count > entries[j].count
+	})
+	fmt.Fprintf(w, "scheduler: %s:\n", title)
+	limit := 8
+	if len(entries) < limit {
+		limit = len(entries)
+	}
+	for i := 0; i < limit; i++ {
+		fmt.Fprintf(w, "  - %s: %d\n", entries[i].name, entries[i].count)
+	}
+}
+
+func auditConstraintGroup(label string) string {
+	switch {
+	case strings.HasPrefix(label, "link_"):
+		return "frequency link"
+	case strings.HasPrefix(label, "one_"):
+		return "frequency choose-one"
+	case strings.HasPrefix(label, "oneperday_"):
+		return "same-day exclusivity"
+	case strings.HasPrefix(label, "quota_"), strings.HasPrefix(label, "quota_min_"), strings.HasPrefix(label, "quota_max_"):
+		return "hourly quota"
+	case strings.HasPrefix(label, "minblk_"), strings.HasPrefix(label, "noshort_"):
+		return "minimum block"
+	case strings.HasPrefix(label, "daylink_"):
+		return "day consolidation link"
+	case strings.HasPrefix(label, "nooverlap_"):
+		return "slot no-overlap"
+	case strings.HasPrefix(label, "no3gym_"):
+		return "gym spacing"
+	case strings.HasPrefix(label, "nogymrun_"):
+		return "gym/run day exclusion"
+	case strings.HasPrefix(label, "mlink_"):
+		return "meal aggregation"
+	case strings.HasPrefix(label, "mealgap_"):
+		return "meal gap"
+	case strings.HasPrefix(label, "gagglink_"):
+		return "gym aggregation"
+	case strings.HasPrefix(label, "mealgymgap_"):
+		return "meal before gym"
+	case label == "prodmin", label == "prodmax":
+		return "total productive range"
+	default:
+		return "other"
+	}
+}
+
+func auditVariableGroup(name string) string {
+	switch {
+	case strings.HasPrefix(name, "x_"):
+		return "schedule occupancy"
+	case strings.HasPrefix(name, "s_"):
+		return "frequency starts"
+	case strings.HasPrefix(name, "dayhas_"):
+		return "day usage flags"
+	case strings.HasPrefix(name, "m_"):
+		return "meal aggregates"
+	case strings.HasPrefix(name, "gagg_"):
+		return "gym aggregates"
+	case name == "under_prod", name == "over_prod":
+		return "total productive slack"
+	default:
+		return "other"
+	}
 }
 
 func parseSolution(path string) (map[string]float64, string, error) {
@@ -1091,6 +1501,13 @@ func parseHHMM(s string) int {
 	if s == "" {
 		return 0
 	}
+	if len(s) == 4 && !strings.Contains(s, ":") {
+		h, errH := strconv.Atoi(s[:2])
+		m, errM := strconv.Atoi(s[2:])
+		if errH == nil && errM == nil && h >= 0 && h < 24 && m >= 0 && m < 60 {
+			return h*60 + m
+		}
+	}
 	t, err := time.Parse("15:04", s)
 	if err != nil {
 		return 0
@@ -1098,8 +1515,136 @@ func parseHHMM(s string) int {
 	return t.Hour()*60 + t.Minute()
 }
 
+func constraintTimeForDay(constraints []string, prefix string, dayIdx int) (int, bool) {
+	dayName := indexToDayName(dayIdx)
+	prefix = strings.ToLower(prefix)
+	for _, c := range constraints {
+		parts := strings.Split(strings.ToLower(c), ":")
+		if len(parts) != 3 {
+			continue
+		}
+		if parts[0] != prefix || parts[1] != dayName {
+			continue
+		}
+		return parseHHMM(parts[2]), true
+	}
+	return 0, false
+}
+
+func constraintPenaltyWindowsForDay(constraints []string, dayIdx int) []penaltyWindow {
+	dayName := indexToDayName(dayIdx)
+	var windows []penaltyWindow
+	for _, c := range constraints {
+		parts := strings.Split(strings.ToLower(c), ":")
+		if len(parts) != 5 {
+			continue
+		}
+		if parts[0] != "avoid_window" || parts[1] != dayName {
+			continue
+		}
+		start := parseHHMM(parts[2])
+		end := parseHHMM(parts[3])
+		penalty, err := strconv.Atoi(parts[4])
+		if err != nil || start == 0 || end == 0 || end <= start || penalty <= 0 {
+			continue
+		}
+		windows = append(windows, penaltyWindow{start: start, end: end, penalty: penalty})
+	}
+	return windows
+}
+
+func instancesHaveConstraint(instances []actInstance, constraint string) bool {
+	for _, inst := range instances {
+		if contains(inst.act.Constraints, constraint) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAdjacentOccupiedType(day, slot, slotsPerDay int, occupiedTypes map[int]ActivityType, typ ActivityType) bool {
+	gi := day*slotsPerDay + slot
+	for _, neighbor := range []int{gi - 1, gi + 1} {
+		if occupiedTypes[neighbor] == typ {
+			return true
+		}
+	}
+	return false
+}
+
+func relabelShortBreakSlivers(schedule *Schedule, cfg *config.Config, slotsPerDay int) {
+	minWorkSlots := minWorkBlockSlots(cfg)
+	if minWorkSlots <= 1 {
+		return
+	}
+	minAdminSlots := 45 / cfg.Day.Granularity
+	if minAdminSlots < 1 {
+		minAdminSlots = 1
+	}
+	for d := 0; d < 7; d++ {
+		runStart := -1
+		runLen := 0
+		flush := func() {
+			if runStart == -1 {
+				return
+			}
+			if runLen >= minAdminSlots && runLen < minWorkSlots {
+				for offset := 0; offset < runLen; offset++ {
+					gi := d*slotsPerDay + runStart + offset
+					if gi >= len(schedule.Slots) {
+						continue
+					}
+					schedule.Slots[gi].Activity = secondaryProductiveActivityName(cfg)
+					schedule.Slots[gi].Type = TypeUni
+				}
+			}
+			runStart = -1
+			runLen = 0
+		}
+		for s := 0; s < slotsPerDay; s++ {
+			gi := d*slotsPerDay + s
+			if gi < len(schedule.Slots) && schedule.Slots[gi].Activity == "Break" {
+				if runStart == -1 {
+					runStart = s
+				}
+				runLen++
+				continue
+			}
+			flush()
+		}
+		flush()
+	}
+}
+
+func minWorkBlockSlots(cfg *config.Config) int {
+	for _, act := range cfg.Activities {
+		if act.Name != "Work" || act.MinDuration <= 0 {
+			continue
+		}
+		return act.MinDuration / cfg.Day.Granularity
+	}
+	return 0
+}
+
+func secondaryProductiveActivityName(cfg *config.Config) string {
+	for _, act := range cfg.Activities {
+		if act.Type == "uni" && strings.Contains(strings.ToLower(act.Name), "self-study") {
+			return act.Name
+		}
+	}
+	return "Self-Study/Admin/Projects"
+}
+
 func sanitize(s string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(strings.ToLower(s), " ", ""), "-", "")
+	replacer := strings.NewReplacer(
+		" ", "",
+		"-", "",
+		"/", "",
+		"(", "",
+		")", "",
+		".", "",
+	)
+	return replacer.Replace(strings.ToLower(s))
 }
 
 func abs(x int) int {

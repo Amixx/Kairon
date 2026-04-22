@@ -35,22 +35,24 @@ type IgnoreRule struct {
 }
 
 type Activity struct {
-	Name          string   `yaml:"name"`
-	Type          string   `yaml:"type"`
-	Duration      int      `yaml:"duration"`
-	MinDuration   int      `yaml:"min_duration"`
-	HoursPerWeek  float64  `yaml:"hours_per_week"`
-	Frequency     int      `yaml:"frequency"`
-	Priority      string   `yaml:"priority"`
-	Earliest      string   `yaml:"earliest"`
-	Latest        string   `yaml:"latest"`
-	PreferredTime string   `yaml:"preferred_time"`
-	PreferredDay  string   `yaml:"preferred_day"`
-	PreferredDays []string `yaml:"preferred_days"`
-	Constraints   []string `yaml:"constraints"`
-	AllowedDays   []string `yaml:"allowed_days"`
-	Location      string   `yaml:"location"`
-	Notes         string   `yaml:"notes"`
+	Name            string   `yaml:"name"`
+	Type            string   `yaml:"type"`
+	Duration        int      `yaml:"duration"`
+	MinDuration     int      `yaml:"min_duration"`
+	HoursPerWeek    float64  `yaml:"hours_per_week"`
+	MinHoursPerWeek float64  `yaml:"min_hours_per_week"`
+	MaxHoursPerWeek float64  `yaml:"max_hours_per_week"`
+	Frequency       int      `yaml:"frequency"`
+	Priority        string   `yaml:"priority"`
+	Earliest        string   `yaml:"earliest"`
+	Latest          string   `yaml:"latest"`
+	PreferredTime   string   `yaml:"preferred_time"`
+	PreferredDay    string   `yaml:"preferred_day"`
+	PreferredDays   []string `yaml:"preferred_days"`
+	Constraints     []string `yaml:"constraints"`
+	AllowedDays     []string `yaml:"allowed_days"`
+	Location        string   `yaml:"location"`
+	Notes           string   `yaml:"notes"`
 }
 
 type FixedEvent struct {
