@@ -1,0 +1,113 @@
+# Kairon Configuration
+# Edit rules here or ask the agent to update via natural language.
+
+calendars:
+  - id: "primary"
+    name: "Personal"
+  # TUM subscription calendar — replace with actual calendar ID after first sync
+  - id: "6a4h38ovkaue3p1880a5ijoglmsv02vg@import.calendar.google.com"
+    name: "TUM University"
+
+day:
+  start: "07:30"
+  end: "21:00"
+  granularity: 15  # minutes
+
+# Events matching these patterns are shown faded and treated as free time
+ignored_events:
+  - pattern: "Fachschaftsvollversammlung"
+
+# Commute buffer for on-campus events (minutes each way)
+commute_buffer: 45
+
+# Minimum gap between meals in minutes (soft constraint)
+min_meal_gap: 180
+
+activities:
+  - name: "Work"
+    type: work
+    duration: 120        # preferred block size in minutes
+    min_duration: 90     # minimum block size
+    hours_per_week: 20
+    priority: critical
+    earliest: "07:30"
+    latest: "21:00"
+    preferred_time: "morning"
+    constraints:
+      - "consolidate_days"       # fewer days with longer blocks preferred
+    allowed_days: [mon, tue, wed, thu, fri, sat, sun]
+    preferred_days: [mon, tue, wed, thu, fri]
+    notes: "Sunday acceptable for overflow, Saturday less preferred"
+
+  - name: "Gym"
+    type: fitness
+    duration: 135        # 2h15 including commute
+    frequency: 4         # times per week
+    priority: important
+    earliest: "07:30"
+    latest: "16:00"      # must end by 16:00
+    constraints:
+      - "no_three_consecutive_gym_days"
+      - "pattern: gym-gym-run-gym-gym"
+    allowed_days: [mon, tue, wed, thu, fri, sun]
+    preferred_days: [mon, tue, wed, thu, fri]
+    notes: "Avoid Saturday. One Sunday session OK if needed."
+
+  - name: "Easy Run"
+    type: fitness
+    duration: 75         # 1h15
+    frequency: 1         # once per week
+    priority: important
+    earliest: "07:30"
+    latest: "21:00"
+    preferred_day: thu
+    location: home
+    notes: "Home only, no commute needed. Counts as break between gym days."
+
+  - name: "Self-Study"
+    type: uni
+    duration: 60         # preferred block size
+    min_duration: 30
+    hours_per_week: 5
+    priority: mid
+    earliest: "07:30"
+    latest: "21:00"
+    notes: "Includes university admin tasks"
+
+  - name: "Breakfast"
+    type: meal
+    duration: 30
+    frequency: 7
+    priority: important
+    preferred_time: "10:00"
+    latest: "10:30"
+    notes: "Ideal at 10:00, no later than 10:00 start (10:30 end)"
+
+  - name: "Lunch"
+    type: meal
+    duration: 30
+    frequency: 7
+    priority: important
+    preferred_time: "13:00"
+
+  - name: "Dinner"
+    type: meal
+    duration: 30
+    frequency: 7
+    priority: important
+    preferred_time: "19:00"
+    latest: "20:00"
+
+  - name: "Break"
+    type: break
+    duration: 15
+    priority: suggestion
+    notes: "Auto-fill gaps under 30 minutes between events"
+
+# Fixed weekly events not from calendar (if any)
+fixed_events:
+  - name: "Work Meeting"
+    day: thu
+    start: "16:00"
+    end: "16:30"
+    type: work
