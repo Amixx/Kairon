@@ -11,7 +11,7 @@ calendars:
 day:
   start: "07:30"
   end: "21:00"
-  granularity: 15  # minutes
+  granularity: 15 # minutes
 
 # Events matching these patterns are shown faded and treated as free time
 ignored_events:
@@ -26,8 +26,8 @@ min_meal_gap: 180
 activities:
   - name: "Work"
     type: work
-    duration: 120        # preferred block size in minutes
-    min_duration: 90     # minimum block size
+    duration: 120 # preferred block size in minutes
+    min_duration: 90 # minimum block size
     hours_per_week: 20
     min_hours_per_week: 19
     max_hours_per_week: 21
@@ -36,7 +36,7 @@ activities:
     latest: "21:00"
     preferred_time: "morning"
     constraints:
-      - "consolidate_days"       # fewer days with longer blocks preferred
+      - "consolidate_days" # fewer days with longer blocks preferred
       - "avoid_window:fri:1800:2100:8"
       - "avoid_window:sat:0730:1200:4"
       - "avoid_window:sat:1800:2100:6"
@@ -47,11 +47,11 @@ activities:
 
   - name: "Gym"
     type: fitness
-    duration: 135        # 2h15 including commute
-    frequency: 4         # times per week
+    duration: 135 # 2h15 including commute
+    frequency: 4 # times per week
     priority: important
     earliest: "07:30"
-    latest: "16:00"      # must end by 16:00
+    latest: "16:00" # must end by 16:00
     constraints:
       - "no_three_consecutive_gym_days"
       - "pattern: gym-gym-run-gym-gym"
@@ -63,8 +63,8 @@ activities:
 
   - name: "Easy Run"
     type: fitness
-    duration: 75         # 1h15
-    frequency: 1         # once per week
+    duration: 75 # 1h15
+    frequency: 1 # once per week
     priority: important
     earliest: "07:30"
     latest: "18:45"
@@ -73,11 +73,12 @@ activities:
     location: home
     constraints:
       - "prefer_late"
-    notes: "Home only, no commute needed. Counts as break between gym days. Prefer it right before dinner; never after dinner."
+      - "avoid_weekend:60"
+    notes: "Home only, no commute needed. Counts as break between gym days. Prefer it right before dinner; never after dinner. Biased off weekends so cardio stays spread — weekends may get eaten by a day-long hike."
 
   - name: "Self-Study/Admin/Projects"
     type: uni
-    duration: 60         # preferred block size
+    duration: 60 # preferred block size
     min_duration: 45
     hours_per_week: 18
     min_hours_per_week: 14

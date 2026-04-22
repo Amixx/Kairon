@@ -239,12 +239,12 @@ func GenerateWithOptions(cfg *config.Config, events []calendar.Event, weekStart 
 	}
 
 	// Solve with time limit and lightweight progress updates.
-	const solverLimit = 45 * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), solverLimit+5*time.Second)
+	const solverLimit = 90 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), solverLimit+10*time.Second)
 	defer cancel()
 
 	fmt.Fprintf(os.Stderr, "scheduler: generated MILP, starting CBC solve (limit %s)\n", solverLimit)
-	cmd := exec.CommandContext(ctx, "cbc", lpFile, "solve", "-sec", "45", "-solution", solFile)
+	cmd := exec.CommandContext(ctx, "cbc", lpFile, "solve", "-sec", "90", "-solution", solFile)
 	var outputBuf bytes.Buffer
 	cmd.Stdout = &outputBuf
 	cmd.Stderr = &outputBuf
@@ -520,6 +520,11 @@ func validateSchedule(schedule *Schedule, cfg *config.Config, slotsPerDay int) [
 		}
 	}
 
+	// Gym must not land on both weekend days.
+	if dayActivity[5]["Gym"] > 0 && dayActivity[6]["Gym"] > 0 {
+		errs = append(errs, "Gym scheduled on both Saturday and Sunday (should be at most one)")
+	}
+
 	return errs
 }
 
@@ -664,6 +669,15 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 					latePenalty := (latestStart - slotStart) / gran
 					if latePenalty > 0 {
 						objCoeffs[sv] += latePenalty * 2
+					}
+				}
+
+				// `avoid_weekend:N` pushes frequency placements (e.g. Easy Run)
+				// away from Sat/Sun so cardio stays spread across the week and
+				// weekend days remain free for longer unstructured activities.
+				if d == 5 || d == 6 {
+					if penalty := constraintIntValue(inst.act.Constraints, "avoid_weekend"); penalty > 0 {
+						objCoeffs[sv] += penalty
 					}
 				}
 			}
@@ -1059,6 +1073,29 @@ func writeLPFile(path string, instances []actInstance, cfg *config.Config, slots
 		}
 	}
 
+	// --- Gym cannot fall on both Saturday and Sunday ---
+	// Realistically one weekend day often gets eaten by a full-day activity,
+	// so we never want both gyms pinned to the weekend.
+	if len(gymInstances) > 0 {
+		var weekendStarts []string
+		for _, inst := range gymInstances {
+			for _, sv := range instStartVars[inst.id] {
+				parts := strings.Split(sv, "_")
+				if len(parts) < 3 {
+					continue
+				}
+				dayField := parts[len(parts)-2]
+				if dayField == "5" || dayField == "6" {
+					weekendStarts = append(weekendStarts, sv)
+				}
+			}
+		}
+		if len(weekendStarts) > 1 {
+			constraints = append(constraints, fmt.Sprintf("  gymweekend: %s <= 1",
+				strings.Join(weekendStarts, " + ")))
+		}
+	}
+
 	// --- Easy Run and Gym cannot share a day ---
 	runInstances := nameToInstances["Easy Run"]
 	if len(gymInstances) > 0 && len(runInstances) > 0 {
@@ -1363,6 +1400,8 @@ func auditConstraintGroup(label string) string {
 		return "gym spacing"
 	case strings.HasPrefix(label, "nogymrun_"):
 		return "gym/run day exclusion"
+	case label == "gymweekend":
+		return "gym weekend limit"
 	case strings.HasPrefix(label, "mlink_"):
 		return "meal aggregation"
 	case strings.HasPrefix(label, "mealgap_"):
@@ -1513,6 +1552,22 @@ func parseHHMM(s string) int {
 		return 0
 	}
 	return t.Hour()*60 + t.Minute()
+}
+
+func constraintIntValue(constraints []string, prefix string) int {
+	prefix = strings.ToLower(prefix) + ":"
+	for _, c := range constraints {
+		lc := strings.ToLower(c)
+		if !strings.HasPrefix(lc, prefix) {
+			continue
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(lc[len(prefix):]))
+		if err != nil || v < 0 {
+			continue
+		}
+		return v
+	}
+	return 0
 }
 
 func constraintTimeForDay(constraints []string, prefix string, dayIdx int) (int, bool) {
